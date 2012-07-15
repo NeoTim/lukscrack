@@ -41,10 +41,6 @@ http://www.gnu.org/copyleft/gpl.html
 import hashlib
 import math
 import struct
-
-# will need changed to use Crypto.Random (now in python-crypt git)
-# see: http://lists.dlitz.net/pipermail/pycrypto/2008q3/000020.html
-from Crypto.Util.randpool import RandomPool
 from Crypto.Cipher import XOR
 
 
@@ -77,34 +73,6 @@ def _diffuse(block, size, digest):
         hash.update(block[full_blocks * digest_size:])
         ret += hash.digest()[:padding]
 
-    return ret
-
-
-def AFSplit(data, stripes, digesttype='sha1'):
-    """AF-Split data using digesttype.  Returned data size will be len(data) * stripes"""
-
-    blockSize = len(data)
-
-    rand = RandomPool()
-
-    bufblock = "\x00" * blockSize
-
-    ret = ""
-    for i in range(0, stripes - 1):
-
-        # Get some random data
-        rand.randomize()
-        rand.stir()
-        r = rand.get_bytes(blockSize)
-        if rand.entropy < 0:
-            print "Warning: RandomPool entropy dropped below 0"
-
-        ret += r
-        bufblock = _xor(r, bufblock)
-        bufblock = _diffuse(bufblock, blockSize, digesttype)
-        rand.add_event(bufblock)
-
-    ret += _xor(bufblock, data)
     return ret
 
 
