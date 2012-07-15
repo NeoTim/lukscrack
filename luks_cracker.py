@@ -61,14 +61,9 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
 http://www.gnu.org/copyleft/gpl.html
 """
 
-import os
 import math
 import struct
 import hashlib
-
-# will need changed to use Crypto.Random (now in python-crypt git)
-# see: http://lists.dlitz.net/pipermail/pycrypto/2008q3/000020.html
-from Crypto.Util.randpool import RandomPool
 from Crypto.Cipher import AES, CAST, Blowfish
 import PBKDFv2
 import AfSplitter
@@ -157,69 +152,6 @@ class LuksFile:
 
         self.masterKey = None
 
-    def set_key(self, keyIndex, password, iterations, checkMinStripes=0):
-        """Sets the key block at keyIndex using password
-
-          Sets the key block at keyIndex using password, hashed iterations
-          times using PBKDFv2 (RFC2104).  This LuksFile must be unlocked by
-          calling open_any_key() before calling this function.
-          checkMinStripes is used to detect basic header manipulation, since
-          the number of stripes for the key is set by create(), before
-          we write a password to disk we make sure the key is not weak because
-          of a small number of stripes.
-
-          This function will raise an error if the key is already enabled.
-          """
-
-        # Some checks
-        if self.masterKey == None:
-            raise LuksError("A key has not been unlocked.  Call open_any_key() first.")
-
-        if keyIndex < 0 or keyIndex > 7:
-            raise LuksError("keyIndex out of range")
-
-        key = self.keys[keyIndex]
-        if key.active != self.LUKS_KEY_DISABLED:
-            raise LuksError("Key is active.  Delete the key and try again")
-
-        if checkMinStripes == 0:
-            checkMinStripes = self.KEY_STRIPES
-        if key.stripes < checkMinStripes:
-            raise LuksError("Key section %i contains too few stripes.  Header manipulation?" % keyIndex)
-
-        key.passwordIterations = iterations
-
-        # Generate a random salt for this key
-        rand = RandomPool(self.SALT_SIZE)
-        key.passwordSalt = rand.get_bytes(self.SALT_SIZE)
-
-        # Hash the key using PBKDFv2
-        pbkdf = PBKDFv2.PBKDFv2()
-        derived_key = pbkdf.makeKey(password, key.passwordSalt, key.passwordIterations, self.keyBytes, self.hashSpec)
-
-        # Split the key into key.stripes
-        AfKey = AfSplitter.AFSplit(self.masterKey, key.stripes, self.hashSpec)
-
-        AfKeySize = len(AfKey)
-        if AfKeySize != key.stripes * self.keyBytes:
-            raise LuksError("ERROR: AFSplit did not return the correct length of key")
-
-        # Set the key for IV generation
-        self.ivGen.set_key(derived_key)
-
-        # Encrypt the splitted key using the hashed password
-        AfSectors = int(math.ceil(float(AfKeySize) / self.SECTOR_SIZE))
-        for sector in range(0, AfSectors):
-            self._encrypt_sector(derived_key, key.keyMaterialOffset + sector, sector,\
-                                 AfKey[int(sector * self.SECTOR_SIZE):int((sector + 1) * self.SECTOR_SIZE)])
-
-        key.active = self.LUKS_KEY_ENABLED
-
-        # Reset the key used for to IV generation in data mode
-        self.ivGen.set_key(self.masterKey)
-
-        self._save_header()
-
     def open_key(self, keyIndex, password):
         """Open a specific keyIndex using password.  Returns True on success"""
 
@@ -262,8 +194,6 @@ class LuksFile:
         if checkDigest != self.mkDigest:
             return False
 
-        self.masterKey = masterKey
-        self.ivGen.set_key(self.masterKey)
         return True
 
     def open_any_key(self, password):
@@ -302,70 +232,6 @@ class LuksFile:
         active = (key.active == self.LUKS_KEY_ENABLED)
         return (active, key.passwordIterations, key.stripes)
 
-    def delete_key(self, keyIndex):
-        """Delete the key located in slot keyIndex.  WARNING! This is NOT a secure delete
-
-          Warning! If keyIndex is the last enabled key, the data will become unrecoverable
-
-          This function will not securely delete the key.  Because this class is designed
-          for reading and writing to a file, there is no guarante that writing over the data
-          inside the file will destroy it.  If you have a key leaked, you need to investigate
-          other methods of securely destroying data, including destroying the entire file system
-          and disk this file was located on, and any backups of this file that were created
-          (depending on your needs).  The good news is, because of the way LUKS encrypts the
-          master key, only one bit in the master key needs to be destoryed.  But the same bit
-          needs to be destroyed in all copies, including (possibly) the journal, bad remapped
-          blocks on the disk, etc.
-
-          If you would like to continue using this encrypted file, you need to set_key() a new
-          key, delete_key() the leaked key, and then copy the file into a new file on a
-          different disk and filesystem.  This class writes "FF" to the key location during
-          delete_key(), so during the copy the new disk will just get "FF" in the key location,
-          which will be unrecoverable on the new disk.
-          """
-
-        if self.file == None:
-            raise LuksError("LuksFile has not been initialized")
-
-        if keyIndex < 0 or keyIndex > 7:
-            raise LuksError("keyIndex out of range")
-
-        key = self.keys[keyIndex]
-
-        # Start and end offset of the key material
-        startOffset = key.keyMaterialOffset
-        endOffset = startOffset + int(math.ceil((self.keyBytes * key.stripes) / self.SECTOR_SIZE))
-
-        # Just write "FF" into the locations
-        for i in range(startOffset, endOffset):
-            self.file.seek(int(i * self.SECTOR_SIZE))
-            self.file.write("\xFF" * int(self.SECTOR_SIZE))
-
-        try:
-            self.file.flush()
-            os.fsync(self.file.fileno())
-        except:
-            # We might get an error because self.file.fileno() does not exist on StringIO
-            pass
-
-        key.active = self.LUKS_KEY_DISABLED
-        key.passwordIterations = 0
-        key.passwordSalt = ''
-
-        self._save_header()
-
-    def close(self):
-        """Close the underlying file descriptor, and discard the cached master key used for decryption"""
-
-        if self.ivGen != None:
-            self.ivGen.set_key("")
-        if self.file != None:
-            self.file.close()
-
-        self.file = None
-        self.masterKey = None
-        self.ivGen = None
-
     def data_length(self):
         """Returns the total data length"""
 
@@ -376,66 +242,6 @@ class LuksFile:
         self.file.seek(0, 2)
         fLen = self.file.tell()
         return fLen - int(self.payloadOffset * self.SECTOR_SIZE)
-
-    def truncate(self, length):
-        """Truncate the file so that the data is maximum of length in size"""
-
-        if self.file == None:
-            raise LuksError("LuksFile has not been initialized")
-
-        if length % self.SECTOR_SIZE != 0:
-            raise LuksError("length must be a multiple of %s" % self.SECTOR_SIZE)
-
-        if length < 0:
-            raise LuksError("length must be positive")
-
-        self.file.truncate(int(self.payloadOffset * self.SECTOR_SIZE) + length)
-
-    def encrypt_data(self, offset, data):
-        """Encrypt data into the file.
-
-          Offset is a zero indexed location in the data to write.
-          Both offset and len(data) must be multiples of 512.
-          """
-
-        # Check conditions
-        if self.masterKey == None:
-            raise LuksError("A key has not been unlocked.  Call open_any_key() first.")
-
-        if offset % self.SECTOR_SIZE != 0:
-            raise LuksError("offset must be a multiple of %s" % self.SECTOR_SIZE)
-
-        dataLen = len(data)
-        if dataLen % self.SECTOR_SIZE != 0:
-            raise LuksError("data length must be a multiple of %s" % self.SECTOR_SIZE)
-
-        # Encrypt all the data
-        startSector = int(offset / self.SECTOR_SIZE)
-        endSector = int((offset + dataLen) / self.SECTOR_SIZE)
-        for sector in range(startSector, endSector):
-            dslice_sector = sector - startSector
-            dslice = data[int(dslice_sector * self.SECTOR_SIZE):int((dslice_sector + 1) * self.SECTOR_SIZE)]
-            self._encrypt_sector(self.masterKey, self.payloadOffset + sector, sector, dslice)
-
-    def decrypt_data(self, offset, length):
-        """Decrypt data from the file.
-
-          Offset is a zero indexed location into the data, and length is
-          the ammout of data to return.  offset and length can be any value,
-          but multiples of 512 are the most efficient.
-          """
-
-        if self.masterKey == None:
-            raise LuksError("A key has not been unlocked.  Call open_any_key() first.")
-
-        frontPad = int(offset % self.SECTOR_SIZE)
-        startSector = int(math.floor(offset / self.SECTOR_SIZE))
-        endSector = int(math.ceil((offset + length) / self.SECTOR_SIZE))
-        ret = ""
-        for sector in range(startSector, endSector):
-            ret += self._decrypt_sector(self.masterKey, self.payloadOffset + sector, sector)
-
-        return ret[frontPad:frontPad + length]
 
     ##### Private functions
 
